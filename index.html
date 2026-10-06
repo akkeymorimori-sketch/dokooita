@@ -4,6 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>どこ置いた？</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-title" content="どこ置いた">
+<meta name="theme-color" content="#4a90e2">
 <style>
 body{font-family:sans-serif;margin:0;background:#f5f5f5;padding-bottom:90px}
 header{position:sticky;top:0;background:#fff;padding:10px;box-shadow:0 1px 4px #0002;z-index:1}
@@ -22,6 +26,7 @@ h2{font-size:14px;margin:12px 10px 4px;color:#666}
 .name{font-weight:bold}
 .place{color:#444;font-size:14px}
 .tagline{color:#4a90e2;font-size:12px}
+.dates{color:#999;font-size:11px;margin-top:2px}
 #add{position:fixed;right:20px;bottom:20px;width:60px;height:60px;border-radius:50%;border:none;background:#4a90e2;color:#fff;font-size:30px}
 dialog{width:90%;max-width:400px;border:none;border-radius:10px;max-height:90vh;overflow-y:auto}
 dialog label{display:block;margin-top:8px;font-size:14px}
@@ -30,9 +35,11 @@ dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
 #tagSuggest .tag{font-size:14px;cursor:pointer}
 .placeBox{border:1px solid #ccc;border-radius:8px;padding:8px;margin-top:10px;background:#fafafa}
 .ptitle{font-weight:bold;font-size:14px;margin-bottom:4px}
+.photoBtns{display:flex;gap:6px}
+.photoBtns button{flex:1;padding:6px}
 .preview{width:100%;max-height:180px;object-fit:contain;margin-top:6px}
 .placeBox textarea{margin-top:6px}
-.placeBox button{margin-top:6px;margin-right:6px}
+.placeBox .sub{margin-top:6px;margin-right:6px}
 #addPlace{margin-top:10px;width:100%;padding:8px}
 #impDlg button{display:block;width:100%;margin-top:8px;padding:10px}
 </style>
@@ -54,7 +61,7 @@ dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
 <dialog id="dlg">
   <form method="dialog">
     <label>名前<input id="name" required></label>
-    <label>よみ（ひらがな）<input id="yomi" required></label>
+    <label>よみ（空欄でもOK）<input id="yomi" placeholder="漢字の名前なら入れると五十音順に並ぶ"></label>
     <label>タグ（スペース区切り）<input id="tagInput" autocomplete="off"></label>
     <div id="tagSuggest"></div>
     <div id="places"></div>
@@ -82,8 +89,28 @@ const $ = id => document.getElementById(id);
 const collator = new Intl.Collator('ja');
 const emptyPlace = () => ({ memo: '', photo: null });
 
+// オフライン対応・ホーム画面アプリ化
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 // データを消されにくくする（保証はない）
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+
+// --- 画像URLの管理（使い終わったら解放する） ---
+const listUrls = [], dlgUrls = [];
+const urlFor = (blob, bag) => { const u = URL.createObjectURL(blob); bag.push(u); return u; };
+const freeUrls = bag => { bag.forEach(u => URL.revokeObjectURL(u)); bag.length = 0; };
+
+// --- 日付 ---
+const fmt = (t, sep) => {
+  const d = new Date(t);
+  return d.getFullYear() + sep + String(d.getMonth() + 1).padStart(2, '0') + sep + String(d.getDate()).padStart(2, '0');
+};
+function ago(t) {
+  const d = Math.floor((Date.now() - t) / 86400000);
+  if (d < 1) return '今日';
+  if (d < 30) return d + '日前';
+  if (d < 365) return Math.floor(d / 30) + 'か月前';
+  return Math.floor(d / 365) + '年前';
+}
 
 // --- データ保存（IndexedDB） ---
 const req = indexedDB.open('dokooita', 1);
@@ -92,7 +119,7 @@ req.onsuccess = e => { db = e.target.result; load(); };
 
 const store = mode => db.transaction('items', mode).objectStore('items');
 
-// 前の形式（場所1つ）のデータを新しい形式に変換
+// 古い形式のデータをそろえる
 function normalize(i) {
   if (!i.places) {
     i.places = [{ memo: i.place || '', photo: i.photo || null }];
@@ -100,6 +127,8 @@ function normalize(i) {
     delete i.photo;
   }
   if (!i.tags) i.tags = [];
+  if (!i.yomi) i.yomi = '';
+  if (!i.created) i.created = i.id; // IDは登録した時刻
   return i;
 }
 function load() {
@@ -110,16 +139,17 @@ const save = item => store('readwrite').put(item).onsuccess = load;
 const remove = id => store('readwrite').delete(id).onsuccess = load;
 
 // --- 五十音の行分け ---
-const toHira = s => s.replace(/[ァ-ン]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+const toHira = s => s.replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+const keyOf = i => toHira(i.yomi || i.name);
 const ROWS = [
-  ['あ','あいうえおぁぃぅぇぉゔ'], ['か','かきくけこがぎぐげご'],
+  ['あ','あいうえおぁぃぅぇぉゔ'], ['か','かきくけこがぎぐげごゕゖ'],
   ['さ','さしすせそざじずぜぞ'], ['た','たちつてとだぢづでどっ'],
   ['な','なにぬねの'], ['は','はひふへほばびぶべぼぱぴぷぺぽ'],
   ['ま','まみむめも'], ['や','やゆよゃゅょ'],
   ['ら','らりるれろ'], ['わ','わをんゎ']
 ];
-function rowOf(yomi) {
-  const c = toHira(yomi)[0] || '';
+function rowOf(key) {
+  const c = key[0] || '';
   for (const [k, s] of ROWS) if (s.includes(c)) return k + '行';
   return 'その他';
 }
@@ -127,6 +157,7 @@ const allTagList = () => [...new Set(items.flatMap(i => i.tags))].sort(collator.
 
 // --- 一覧表示 ---
 function render() {
+  freeUrls(listUrls);
   const q = toHira($('search').value.trim().toLowerCase());
 
   $('tags').innerHTML = '';
@@ -145,12 +176,12 @@ function render() {
       const text = [i.name, i.yomi, ...i.places.map(p => p.memo), ...i.tags].join(' ');
       return toHira(text.toLowerCase()).includes(q);
     })
-    .sort((a, b) => collator.compare(toHira(a.yomi), toHira(b.yomi)));
+    .sort((a, b) => collator.compare(keyOf(a), keyOf(b)));
 
   $('list').innerHTML = '';
   let cur = '';
   list.forEach(i => {
-    const r = rowOf(i.yomi);
+    const r = rowOf(keyOf(i));
     if (r !== cur) {
       cur = r;
       const h = document.createElement('h2');
@@ -162,7 +193,7 @@ function render() {
 
     const img = document.createElement('img');
     const first = i.places.find(p => p.photo);
-    if (first) img.src = URL.createObjectURL(first.photo);
+    if (first) img.src = urlFor(first.photo, listUrls);
 
     const t = document.createElement('div');
     const name = document.createElement('div');
@@ -189,6 +220,13 @@ function render() {
     tg.textContent = i.tags.map(x => '#' + x).join(' ');
     t.append(tg);
 
+    const dt = document.createElement('div');
+    dt.className = 'dates';
+    let s = '登録 ' + fmt(i.created, '/') + '（' + ago(i.created) + '）';
+    if (i.updated && i.updated - i.created > 86400000) s += '・更新 ' + ago(i.updated);
+    dt.textContent = s;
+    t.append(dt);
+
     d.append(img, t);
     d.onclick = () => openDlg(i);
     $('list').append(d);
@@ -208,7 +246,16 @@ async function shrink(file, max = 1000) {
 }
 
 // --- 場所の入力欄 ---
+function makeBtn(text, fn, cls) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = text;
+  b.onclick = fn;
+  if (cls) b.className = cls;
+  return b;
+}
 function renderPlaces() {
+  freeUrls(dlgUrls);
   const box = $('places');
   box.innerHTML = '';
   places.forEach((p, idx) => {
@@ -219,45 +266,55 @@ function renderPlaces() {
     title.className = 'ptitle';
     title.textContent = '場所' + (idx + 1);
 
-    const file = document.createElement('input');
-    file.type = 'file';
-    file.accept = 'image/*';
-    file.setAttribute('capture', 'environment');
+    const cam = document.createElement('input');
+    cam.type = 'file';
+    cam.accept = 'image/*';
+    cam.setAttribute('capture', 'environment');
+    cam.hidden = true;
+
+    const alb = document.createElement('input');
+    alb.type = 'file';
+    alb.accept = 'image/*';
+    alb.hidden = true;
+
+    const btns = document.createElement('div');
+    btns.className = 'photoBtns';
+    btns.append(
+      makeBtn('カメラで撮る', () => cam.click()),
+      makeBtn('アルバムから選ぶ', () => alb.click())
+    );
 
     const img = document.createElement('img');
     img.className = 'preview';
 
-    const clear = document.createElement('button');
-    clear.type = 'button';
-    clear.textContent = '写真を外す';
+    const show = () => {
+      img.hidden = clear.hidden = !p.photo;
+      if (p.photo) img.src = urlFor(p.photo, dlgUrls);
+    };
+    const pick = async input => {
+      const f = input.files[0];
+      input.value = '';
+      if (!f) return;
+      try { p.photo = await shrink(f); }
+      catch { alert('この写真は読み込めなかった。別の写真で試してみて'); return; }
+      show();
+    };
+    cam.onchange = () => pick(cam);
+    alb.onchange = () => pick(alb);
+
+    const clear = makeBtn('写真を外す', () => { p.photo = null; show(); }, 'sub');
 
     const memo = document.createElement('textarea');
     memo.rows = 2;
     memo.placeholder = '例：机の右の引き出し';
     memo.value = p.memo;
+    memo.oninput = () => { p.memo = memo.value; };
 
-    const del = document.createElement('button');
-    del.type = 'button';
-    del.textContent = 'この場所を消す';
+    const del = makeBtn('この場所を消す', () => { places.splice(idx, 1); renderPlaces(); }, 'sub');
     del.hidden = places.length === 1;
 
-    const show = () => {
-      img.hidden = clear.hidden = !p.photo;
-      if (p.photo) img.src = URL.createObjectURL(p.photo);
-    };
     show();
-
-    file.onchange = async () => {
-      const f = file.files[0];
-      if (!f) return;
-      p.photo = await shrink(f);
-      show();
-    };
-    clear.onclick = () => { p.photo = null; file.value = ''; show(); };
-    memo.oninput = () => { p.memo = memo.value; };
-    del.onclick = () => { places.splice(idx, 1); renderPlaces(); };
-
-    w.append(title, file, img, clear, memo, del);
+    w.append(title, cam, alb, btns, img, clear, memo, del);
     box.append(w);
   });
 }
@@ -310,17 +367,20 @@ $('add').onclick = () => openDlg(null);
 $('search').oninput = render;
 
 $('dlg').onclose = () => {
+  freeUrls(dlgUrls);
   const v = $('dlg').returnValue;
   if (v === 'save') {
+    const now = Date.now();
     save({
-      id: editing?.id || Date.now(),
+      id: editing?.id || now,
+      created: editing?.created || now,
       name: $('name').value.trim(),
       yomi: $('yomi').value.trim(),
       tags: [...new Set($('tagInput').value.split(/[\s　]+/).filter(Boolean))],
       places: places
         .map(p => ({ memo: p.memo.trim(), photo: p.photo }))
         .filter(p => p.memo || p.photo),
-      updated: Date.now()
+      updated: now
     });
   } else if (v === 'delete' && confirm('削除する？')) {
     remove(editing.id);
@@ -361,11 +421,9 @@ async function exportData() {
   }
   const json = JSON.stringify({ app: 'dokooita', version: 1, exported: Date.now(), items: out });
   const blob = new Blob([json], { type: 'application/json' });
-  const d = new Date();
-  const ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'dokooita-' + ymd + '.json';
+  a.download = 'dokooita-' + fmt(Date.now(), '') + '.json';
   document.body.append(a);
   a.click();
   a.remove();
@@ -399,7 +457,6 @@ $('impDlg').onclose = async () => {
   if (mode !== 'merge' && mode !== 'replace') return;
   if (mode === 'replace' && !confirm('今のデータ ' + items.length + ' 件は全部消えるよ。いい？')) return;
 
-  // 写真を元の形に戻す（トランザクションの前に全部終わらせる）
   let conv;
   try {
     conv = [];
