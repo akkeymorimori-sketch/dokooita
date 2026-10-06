@@ -33,6 +33,8 @@ dialog label{display:block;margin-top:8px;font-size:14px}
 dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
 #tagSuggest{margin-top:4px}
 #tagSuggest .tag{font-size:14px;cursor:pointer}
+.memoSuggest{margin-top:4px}
+.memoSuggest .tag{font-size:13px;cursor:pointer;white-space:normal}
 .placeBox{border:1px solid #ccc;border-radius:8px;padding:8px;margin-top:10px;background:#fafafa}
 .ptitle{font-weight:bold;font-size:14px;margin-bottom:4px}
 .photoBtns{display:flex;gap:6px}
@@ -46,7 +48,7 @@ dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
 </head>
 <body>
 <header>
-  <input id="search" placeholder="検索（名前・よみ・場所・タグ）">
+  <input id="search" placeholder="検索（スペース区切りで絞り込み）">
   <div id="tags"></div>
   <div id="backupBar">
     <span id="lastBackup"></span>
@@ -60,7 +62,7 @@ dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
 
 <dialog id="dlg">
   <form method="dialog">
-    <label>名前<input id="name" required></label>
+    <label>名前<input id="name" required pattern=".*\S.*" title="名前を入れてね"></label>
     <label>よみ（空欄でもOK）<input id="yomi" placeholder="漢字の名前なら入れると五十音順に並ぶ"></label>
     <label>タグ（スペース区切り）<input id="tagInput" autocomplete="off"></label>
     <div id="tagSuggest"></div>
@@ -69,7 +71,7 @@ dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
     <div style="margin-top:12px;display:flex;gap:8px">
       <button value="save">保存</button>
       <button value="cancel" formnovalidate>キャンセル</button>
-      <button value="delete" id="del" formnovalidate hidden>削除</button>
+      <button type="button" id="del" hidden>削除</button>
     </div>
   </form>
 </dialog>
@@ -84,10 +86,10 @@ dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
 </dialog>
 
 <script>
-let db, items = [], editing = null, places = [], activeTag = null, pending = null;
+let db, items = [], editing = null, places = [], activeTag = null, pending = null, thumbsChecked = false;
 const $ = id => document.getElementById(id);
 const collator = new Intl.Collator('ja');
-const emptyPlace = () => ({ memo: '', photo: null });
+const emptyPlace = () => ({ memo: '', photo: null, thumb: null });
 
 // オフライン対応・ホーム画面アプリ化
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
@@ -112,6 +114,9 @@ function ago(t) {
   return Math.floor(d / 365) + '年前';
 }
 
+// 最後に何か変えた時刻（バックアップ警告用）
+const markChanged = () => localStorage.setItem('lastChange', Date.now());
+
 // --- データ保存（IndexedDB） ---
 const req = indexedDB.open('dokooita', 1);
 req.onupgradeneeded = e => e.target.result.createObjectStore('items', { keyPath: 'id' });
@@ -126,6 +131,7 @@ function normalize(i) {
     delete i.place;
     delete i.photo;
   }
+  i.places = i.places.map(p => ({ memo: p.memo || '', photo: p.photo || null, thumb: p.thumb || null }));
   if (!i.tags) i.tags = [];
   if (!i.yomi) i.yomi = '';
   if (!i.created) i.created = i.id; // IDは登録した時刻
@@ -133,14 +139,43 @@ function normalize(i) {
 }
 function load() {
   const r = store('readonly').getAll();
-  r.onsuccess = () => { items = r.result.map(normalize); render(); };
+  r.onsuccess = () => {
+    items = r.result.map(normalize);
+    render();
+    if (!thumbsChecked) fillThumbs();
+  };
 }
-const save = item => store('readwrite').put(item).onsuccess = load;
-const remove = id => store('readwrite').delete(id).onsuccess = load;
+const save = item => { markChanged(); store('readwrite').put(item).onsuccess = load; };
+const remove = id => { markChanged(); store('readwrite').delete(id).onsuccess = load; };
+
+// 小さい版がない写真に、あとからサムネイルを作る（1回だけ）
+async function fillThumbs() {
+  thumbsChecked = true;
+  const todo = items.filter(i => i.places.some(p => p.photo && !p.thumb));
+  if (!todo.length) return;
+  const out = [];
+  for (const i of todo) {
+    const ps = [];
+    for (const p of i.places) {
+      let thumb = p.thumb;
+      if (p.photo && !thumb) { try { thumb = await shrink(p.photo, 160); } catch {} }
+      ps.push({ ...p, thumb });
+    }
+    out.push({ ...i, places: ps });
+  }
+  const tx = db.transaction('items', 'readwrite');
+  const st = tx.objectStore('items');
+  out.forEach(i => st.put(i));
+  tx.oncomplete = load;
+}
+
+// --- 文字の形をそろえる ---
+// 半角カナ→全角、全角英数→半角、大文字→小文字、カタカナ→ひらがな
+const toHira = s => s.replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+const norm = s => toHira((s || '').normalize('NFKC').toLowerCase());
 
 // --- 五十音の行分け ---
-const toHira = s => s.replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
-const keyOf = i => toHira(i.yomi || i.name);
+const keyOf = i => norm(i.yomi || i.name);
 const ROWS = [
   ['あ','あいうえおぁぃぅぇぉゔ'], ['か','かきくけこがぎぐげごゕゖ'],
   ['さ','さしすせそざじずぜぞ'], ['た','たちつてとだぢづでどっ'],
@@ -155,13 +190,26 @@ function rowOf(key) {
 }
 const allTagList = () => [...new Set(items.flatMap(i => i.tags))].sort(collator.compare);
 
+// よく使う順の場所メモ一覧
+function memoList() {
+  const cnt = new Map();
+  items.forEach(i => i.places.forEach(p => {
+    if (p.memo) cnt.set(p.memo, (cnt.get(p.memo) || 0) + 1);
+  }));
+  return [...cnt]
+    .sort((a, b) => b[1] - a[1] || collator.compare(a[0], b[0]))
+    .map(x => x[0]);
+}
+
 // --- 一覧表示 ---
 function render() {
   freeUrls(listUrls);
-  const q = toHira($('search').value.trim().toLowerCase());
+  const tagList = allTagList();
+  if (activeTag && !tagList.includes(activeTag)) activeTag = null;
+  const words = norm($('search').value).split(/\s+/).filter(Boolean);
 
   $('tags').innerHTML = '';
-  allTagList().forEach(t => {
+  tagList.forEach(t => {
     const s = document.createElement('span');
     s.className = 'tag' + (t === activeTag ? ' on' : '');
     s.textContent = t;
@@ -172,9 +220,9 @@ function render() {
   const list = items
     .filter(i => !activeTag || i.tags.includes(activeTag))
     .filter(i => {
-      if (!q) return true;
-      const text = [i.name, i.yomi, ...i.places.map(p => p.memo), ...i.tags].join(' ');
-      return toHira(text.toLowerCase()).includes(q);
+      if (!words.length) return true;
+      const text = norm([i.name, i.yomi, ...i.places.map(p => p.memo), ...i.tags].join(' '));
+      return words.every(w => text.includes(w));
     })
     .sort((a, b) => collator.compare(keyOf(a), keyOf(b)));
 
@@ -193,7 +241,7 @@ function render() {
 
     const img = document.createElement('img');
     const first = i.places.find(p => p.photo);
-    if (first) img.src = urlFor(first.photo, listUrls);
+    if (first) img.src = urlFor(first.thumb || first.photo, listUrls);
 
     const t = document.createElement('div');
     const name = document.createElement('div');
@@ -240,8 +288,10 @@ async function shrink(file, max = 1000) {
   const bmp = await createImageBitmap(file);
   const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
   const c = document.createElement('canvas');
-  c.width = bmp.width * s; c.height = bmp.height * s;
+  c.width = Math.round(bmp.width * s);
+  c.height = Math.round(bmp.height * s);
   c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  bmp.close();
   return new Promise(r => c.toBlob(r, 'image/jpeg', 0.8));
 }
 
@@ -256,6 +306,7 @@ function makeBtn(text, fn, cls) {
 }
 function renderPlaces() {
   freeUrls(dlgUrls);
+  const memos = memoList();
   const box = $('places');
   box.innerHTML = '';
   places.forEach((p, idx) => {
@@ -295,26 +346,48 @@ function renderPlaces() {
       const f = input.files[0];
       input.value = '';
       if (!f) return;
-      try { p.photo = await shrink(f); }
-      catch { alert('この写真は読み込めなかった。別の写真で試してみて'); return; }
+      try {
+        p.photo = await shrink(f);
+        p.thumb = await shrink(f, 160);
+      } catch { alert('この写真は読み込めなかった。別の写真で試してみて'); return; }
       show();
     };
     cam.onchange = () => pick(cam);
     alb.onchange = () => pick(alb);
 
-    const clear = makeBtn('写真を外す', () => { p.photo = null; show(); }, 'sub');
+    const clear = makeBtn('写真を外す', () => { p.photo = p.thumb = null; show(); }, 'sub');
 
     const memo = document.createElement('textarea');
     memo.rows = 2;
     memo.placeholder = '例：机の右の引き出し';
     memo.value = p.memo;
-    memo.oninput = () => { p.memo = memo.value; };
+
+    // 場所メモの候補
+    const sug = document.createElement('div');
+    sug.className = 'memoSuggest';
+    const suggest = () => {
+      const now = memo.value.trim();
+      const q = norm(now);
+      const hits = memos
+        .filter(m => m !== now && (!q || norm(m).includes(q)))
+        .slice(0, q ? 8 : 5);
+      sug.innerHTML = '';
+      hits.forEach(m => {
+        const s = document.createElement('span');
+        s.className = 'tag';
+        s.textContent = m;
+        s.onclick = () => { memo.value = p.memo = m; suggest(); };
+        sug.append(s);
+      });
+    };
+    memo.oninput = () => { p.memo = memo.value; suggest(); };
+    suggest();
 
     const del = makeBtn('この場所を消す', () => { places.splice(idx, 1); renderPlaces(); }, 'sub');
     del.hidden = places.length === 1;
 
     show();
-    w.append(title, cam, alb, btns, img, clear, memo, del);
+    w.append(title, cam, alb, btns, img, clear, memo, sug, del);
     box.append(w);
   });
 }
@@ -327,10 +400,10 @@ function suggestTags() {
   const parts = input.value.split(/[\s　]+/);
   const last = parts[parts.length - 1];
   const used = parts.slice(0, -1);
-  const q = toHira(last.toLowerCase());
+  const q = norm(last);
   const hits = allTagList().filter(t =>
     !used.includes(t) && t !== last &&
-    (!q || toHira(t.toLowerCase()).includes(q))
+    (!q || norm(t).includes(q))
   );
   box.innerHTML = '';
   hits.forEach(t => {
@@ -366,6 +439,11 @@ function openDlg(item) {
 $('add').onclick = () => openDlg(null);
 $('search').oninput = render;
 
+// 削除は確認が通ったときだけ閉じる
+$('del').onclick = () => {
+  if (confirm('「' + editing.name + '」を削除する？')) $('dlg').close('delete');
+};
+
 $('dlg').onclose = () => {
   freeUrls(dlgUrls);
   const v = $('dlg').returnValue;
@@ -378,11 +456,11 @@ $('dlg').onclose = () => {
       yomi: $('yomi').value.trim(),
       tags: [...new Set($('tagInput').value.split(/[\s　]+/).filter(Boolean))],
       places: places
-        .map(p => ({ memo: p.memo.trim(), photo: p.photo }))
+        .map(p => ({ memo: p.memo.trim(), photo: p.photo, thumb: p.thumb }))
         .filter(p => p.memo || p.photo),
       updated: now
     });
-  } else if (v === 'delete' && confirm('削除する？')) {
+  } else if (v === 'delete') {
     remove(editing.id);
   }
 };
@@ -404,9 +482,14 @@ function showLastBackup() {
     el.className = items.length ? 'warn' : '';
     return;
   }
+  const lastChange = Math.max(
+    Number(localStorage.getItem('lastChange')) || 0,
+    ...items.map(i => i.updated || 0)
+  );
+  const changed = lastChange > t;
   const days = Math.floor((Date.now() - t) / 86400000);
-  el.textContent = 'バックアップ：' + (days === 0 ? '今日' : days + '日前');
-  el.className = days >= 7 ? 'warn' : '';
+  el.textContent = 'バックアップ：' + (days === 0 ? '今日' : days + '日前') + (changed ? '（変更あり）' : '');
+  el.className = changed && days >= 7 ? 'warn' : '';
 }
 
 async function exportData() {
@@ -415,7 +498,11 @@ async function exportData() {
   for (const i of items) {
     const ps = [];
     for (const p of i.places) {
-      ps.push({ memo: p.memo, photo: p.photo ? await blobToDataURL(p.photo) : null });
+      ps.push({
+        memo: p.memo,
+        photo: p.photo ? await blobToDataURL(p.photo) : null,
+        thumb: p.thumb ? await blobToDataURL(p.thumb) : null
+      });
     }
     out.push({ ...i, places: ps });
   }
@@ -464,7 +551,10 @@ $('impDlg').onclose = async () => {
       const i = normalize({ ...raw });
       const ps = [];
       for (const p of i.places) {
-        ps.push({ memo: p.memo || '', photo: p.photo ? await dataURLToBlob(p.photo) : null });
+        const photo = p.photo ? await dataURLToBlob(p.photo) : null;
+        let thumb = p.thumb ? await dataURLToBlob(p.thumb) : null;
+        if (photo && !thumb) { try { thumb = await shrink(photo, 160); } catch {} }
+        ps.push({ memo: p.memo, photo, thumb });
       }
       conv.push({ ...i, places: ps });
     }
@@ -487,6 +577,7 @@ $('impDlg').onclose = async () => {
   if (mode === 'replace') st.clear();
   conv.forEach(i => st.put(i));
   tx.oncomplete = () => {
+    markChanged();
     load();
     alert(mode === 'replace'
       ? conv.length + ' 件に置き換えたよ'
