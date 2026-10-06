@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>どこ置いた？</title>
+<style>
+body{font-family:sans-serif;margin:0;background:#f5f5f5;padding-bottom:90px}
+header{position:sticky;top:0;background:#fff;padding:10px;box-shadow:0 1px 4px #0002;z-index:1}
+input,textarea,button{font-size:16px}
+#search{width:100%;padding:8px;box-sizing:border-box}
+#tags{margin-top:6px;overflow-x:auto;white-space:nowrap}
+.tag{display:inline-block;padding:4px 10px;margin:2px;border-radius:12px;background:#e0e0e0}
+.tag.on{background:#4a90e2;color:#fff}
+#backupBar{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12px;color:#666}
+#backupBar span{flex:1}
+#backupBar button{font-size:13px;padding:4px 8px}
+#lastBackup.warn{color:#d33;font-weight:bold}
+h2{font-size:14px;margin:12px 10px 4px;color:#666}
+.item{display:flex;gap:10px;background:#fff;margin:4px 10px;padding:8px;border-radius:8px}
+.item img{width:64px;height:64px;object-fit:cover;border-radius:6px;background:#ddd;flex-shrink:0}
+.name{font-weight:bold}
+.place{color:#444;font-size:14px}
+.tagline{color:#4a90e2;font-size:12px}
+#add{position:fixed;right:20px;bottom:20px;width:60px;height:60px;border-radius:50%;border:none;background:#4a90e2;color:#fff;font-size:30px}
+dialog{width:90%;max-width:400px;border:none;border-radius:10px;max-height:90vh;overflow-y:auto}
+dialog label{display:block;margin-top:8px;font-size:14px}
+dialog input,dialog textarea{width:100%;box-sizing:border-box;padding:6px}
+#tagSuggest{margin-top:4px}
+#tagSuggest .tag{font-size:14px;cursor:pointer}
+.placeBox{border:1px solid #ccc;border-radius:8px;padding:8px;margin-top:10px;background:#fafafa}
+.ptitle{font-weight:bold;font-size:14px;margin-bottom:4px}
+.preview{width:100%;max-height:180px;object-fit:contain;margin-top:6px}
+.placeBox textarea{margin-top:6px}
+.placeBox button{margin-top:6px;margin-right:6px}
+#addPlace{margin-top:10px;width:100%;padding:8px}
+#impDlg button{display:block;width:100%;margin-top:8px;padding:10px}
+</style>
+</head>
+<body>
+<header>
+  <input id="search" placeholder="検索（名前・よみ・場所・タグ）">
+  <div id="tags"></div>
+  <div id="backupBar">
+    <span id="lastBackup"></span>
+    <button id="exportBtn">書き出し</button>
+    <button id="importBtn">読み込み</button>
+    <input type="file" id="importFile" hidden>
+  </div>
+</header>
+<main id="list"></main>
+<button id="add">＋</button>
+
+<dialog id="dlg">
+  <form method="dialog">
+    <label>名前<input id="name" required></label>
+    <label>よみ（ひらがな）<input id="yomi" required></label>
+    <label>タグ（スペース区切り）<input id="tagInput" autocomplete="off"></label>
+    <div id="tagSuggest"></div>
+    <div id="places"></div>
+    <button type="button" id="addPlace">＋場所を追加</button>
+    <div style="margin-top:12px;display:flex;gap:8px">
+      <button value="save">保存</button>
+      <button value="cancel" formnovalidate>キャンセル</button>
+      <button value="delete" id="del" formnovalidate hidden>削除</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="impDlg">
+  <form method="dialog">
+    <p id="impMsg"></p>
+    <button value="merge">今のデータに追加</button>
+    <button value="replace">全部置き換える</button>
+    <button value="cancel">やめる</button>
+  </form>
+</dialog>
+
+<script>
+let db, items = [], editing = null, places = [], activeTag = null, pending = null;
+const $ = id => document.getElementById(id);
+const collator = new Intl.Collator('ja');
+const emptyPlace = () => ({ memo: '', photo: null });
+
+// データを消されにくくする（保証はない）
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+
+// --- データ保存（IndexedDB） ---
+const req = indexedDB.open('dokooita', 1);
+req.onupgradeneeded = e => e.target.result.createObjectStore('items', { keyPath: 'id' });
+req.onsuccess = e => { db = e.target.result; load(); };
+
+const store = mode => db.transaction('items', mode).objectStore('items');
+
+// 前の形式（場所1つ）のデータを新しい形式に変換
+function normalize(i) {
+  if (!i.places) {
+    i.places = [{ memo: i.place || '', photo: i.photo || null }];
+    delete i.place;
+    delete i.photo;
+  }
+  if (!i.tags) i.tags = [];
+  return i;
+}
+function load() {
+  const r = store('readonly').getAll();
+  r.onsuccess = () => { items = r.result.map(normalize); render(); };
+}
+const save = item => store('readwrite').put(item).onsuccess = load;
+const remove = id => store('readwrite').delete(id).onsuccess = load;
+
+// --- 五十音の行分け ---
+const toHira = s => s.replace(/[ァ-ン]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+const ROWS = [
+  ['あ','あいうえおぁぃぅぇぉゔ'], ['か','かきくけこがぎぐげご'],
+  ['さ','さしすせそざじずぜぞ'], ['た','たちつてとだぢづでどっ'],
+  ['な','なにぬねの'], ['は','はひふへほばびぶべぼぱぴぷぺぽ'],
+  ['ま','まみむめも'], ['や','やゆよゃゅょ'],
+  ['ら','らりるれろ'], ['わ','わをんゎ']
+];
+function rowOf(yomi) {
+  const c = toHira(yomi)[0] || '';
+  for (const [k, s] of ROWS) if (s.includes(c)) return k + '行';
+  return 'その他';
+}
+const allTagList = () => [...new Set(items.flatMap(i => i.tags))].sort(collator.compare);
+
+// --- 一覧表示 ---
+function render() {
+  const q = toHira($('search').value.trim().toLowerCase());
+
+  $('tags').innerHTML = '';
+  allTagList().forEach(t => {
+    const s = document.createElement('span');
+    s.className = 'tag' + (t === activeTag ? ' on' : '');
+    s.textContent = t;
+    s.onclick = () => { activeTag = activeTag === t ? null : t; render(); };
+    $('tags').append(s);
+  });
+
+  const list = items
+    .filter(i => !activeTag || i.tags.includes(activeTag))
+    .filter(i => {
+      if (!q) return true;
+      const text = [i.name, i.yomi, ...i.places.map(p => p.memo), ...i.tags].join(' ');
+      return toHira(text.toLowerCase()).includes(q);
+    })
+    .sort((a, b) => collator.compare(toHira(a.yomi), toHira(b.yomi)));
+
+  $('list').innerHTML = '';
+  let cur = '';
+  list.forEach(i => {
+    const r = rowOf(i.yomi);
+    if (r !== cur) {
+      cur = r;
+      const h = document.createElement('h2');
+      h.textContent = r;
+      $('list').append(h);
+    }
+    const d = document.createElement('div');
+    d.className = 'item';
+
+    const img = document.createElement('img');
+    const first = i.places.find(p => p.photo);
+    if (first) img.src = URL.createObjectURL(first.photo);
+
+    const t = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = i.name;
+    t.append(name);
+
+    if (!i.places.length) {
+      const p = document.createElement('div');
+      p.className = 'place';
+      p.textContent = '場所：（メモなし）';
+      t.append(p);
+    }
+    i.places.forEach((pl, n) => {
+      const p = document.createElement('div');
+      p.className = 'place';
+      const label = i.places.length > 1 ? (n + 1) + '. ' : '場所：';
+      p.textContent = label + (pl.memo || (pl.photo ? '（写真のみ）' : '（メモなし）'));
+      t.append(p);
+    });
+
+    const tg = document.createElement('div');
+    tg.className = 'tagline';
+    tg.textContent = i.tags.map(x => '#' + x).join(' ');
+    t.append(tg);
+
+    d.append(img, t);
+    d.onclick = () => openDlg(i);
+    $('list').append(d);
+  });
+
+  showLastBackup();
+}
+
+// --- 写真を縮小して容量を節約 ---
+async function shrink(file, max = 1000) {
+  const bmp = await createImageBitmap(file);
+  const s = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = bmp.width * s; c.height = bmp.height * s;
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  return new Promise(r => c.toBlob(r, 'image/jpeg', 0.8));
+}
+
+// --- 場所の入力欄 ---
+function renderPlaces() {
+  const box = $('places');
+  box.innerHTML = '';
+  places.forEach((p, idx) => {
+    const w = document.createElement('div');
+    w.className = 'placeBox';
+
+    const title = document.createElement('div');
+    title.className = 'ptitle';
+    title.textContent = '場所' + (idx + 1);
+
+    const file = document.createElement('input');
+    file.type = 'file';
+    file.accept = 'image/*';
+    file.setAttribute('capture', 'environment');
+
+    const img = document.createElement('img');
+    img.className = 'preview';
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.textContent = '写真を外す';
+
+    const memo = document.createElement('textarea');
+    memo.rows = 2;
+    memo.placeholder = '例：机の右の引き出し';
+    memo.value = p.memo;
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.textContent = 'この場所を消す';
+    del.hidden = places.length === 1;
+
+    const show = () => {
+      img.hidden = clear.hidden = !p.photo;
+      if (p.photo) img.src = URL.createObjectURL(p.photo);
+    };
+    show();
+
+    file.onchange = async () => {
+      const f = file.files[0];
+      if (!f) return;
+      p.photo = await shrink(f);
+      show();
+    };
+    clear.onclick = () => { p.photo = null; file.value = ''; show(); };
+    memo.oninput = () => { p.memo = memo.value; };
+    del.onclick = () => { places.splice(idx, 1); renderPlaces(); };
+
+    w.append(title, file, img, clear, memo, del);
+    box.append(w);
+  });
+}
+$('addPlace').onclick = () => { places.push(emptyPlace()); renderPlaces(); };
+
+// --- タグの候補表示 ---
+function suggestTags() {
+  const input = $('tagInput');
+  const box = $('tagSuggest');
+  const parts = input.value.split(/[\s　]+/);
+  const last = parts[parts.length - 1];
+  const used = parts.slice(0, -1);
+  const q = toHira(last.toLowerCase());
+  const hits = allTagList().filter(t =>
+    !used.includes(t) && t !== last &&
+    (!q || toHira(t.toLowerCase()).includes(q))
+  );
+  box.innerHTML = '';
+  hits.forEach(t => {
+    const s = document.createElement('span');
+    s.className = 'tag';
+    s.textContent = t;
+    s.onclick = () => {
+      parts[parts.length - 1] = t;
+      input.value = parts.join(' ') + ' ';
+      input.focus();
+      suggestTags();
+    };
+    box.append(s);
+  });
+}
+$('tagInput').oninput = suggestTags;
+
+// --- 登録・編集ダイアログ ---
+function openDlg(item) {
+  editing = item;
+  $('name').value = item?.name || '';
+  $('yomi').value = item?.yomi || '';
+  $('tagInput').value = item && item.tags.length ? item.tags.join(' ') + ' ' : '';
+  suggestTags();
+  places = item && item.places.length
+    ? item.places.map(p => ({ ...p }))
+    : [emptyPlace()];
+  renderPlaces();
+  $('del').hidden = !item;
+  $('dlg').returnValue = '';
+  $('dlg').showModal();
+}
+$('add').onclick = () => openDlg(null);
+$('search').oninput = render;
+
+$('dlg').onclose = () => {
+  const v = $('dlg').returnValue;
+  if (v === 'save') {
+    save({
+      id: editing?.id || Date.now(),
+      name: $('name').value.trim(),
+      yomi: $('yomi').value.trim(),
+      tags: [...new Set($('tagInput').value.split(/[\s　]+/).filter(Boolean))],
+      places: places
+        .map(p => ({ memo: p.memo.trim(), photo: p.photo }))
+        .filter(p => p.memo || p.photo),
+      updated: Date.now()
+    });
+  } else if (v === 'delete' && confirm('削除する？')) {
+    remove(editing.id);
+  }
+};
+
+// --- バックアップ ---
+const blobToDataURL = b => new Promise((ok, ng) => {
+  const fr = new FileReader();
+  fr.onload = () => ok(fr.result);
+  fr.onerror = ng;
+  fr.readAsDataURL(b);
+});
+const dataURLToBlob = async u => (await fetch(u)).blob();
+
+function showLastBackup() {
+  const el = $('lastBackup');
+  const t = Number(localStorage.getItem('lastBackup'));
+  if (!t) {
+    el.textContent = 'バックアップ：まだしてない';
+    el.className = items.length ? 'warn' : '';
+    return;
+  }
+  const days = Math.floor((Date.now() - t) / 86400000);
+  el.textContent = 'バックアップ：' + (days === 0 ? '今日' : days + '日前');
+  el.className = days >= 7 ? 'warn' : '';
+}
+
+async function exportData() {
+  if (!items.length) { alert('まだ何も登録されてないよ'); return; }
+  const out = [];
+  for (const i of items) {
+    const ps = [];
+    for (const p of i.places) {
+      ps.push({ memo: p.memo, photo: p.photo ? await blobToDataURL(p.photo) : null });
+    }
+    out.push({ ...i, places: ps });
+  }
+  const json = JSON.stringify({ app: 'dokooita', version: 1, exported: Date.now(), items: out });
+  const blob = new Blob([json], { type: 'application/json' });
+  const d = new Date();
+  const ymd = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'dokooita-' + ymd + '.json';
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  localStorage.setItem('lastBackup', Date.now());
+  showLastBackup();
+}
+$('exportBtn').onclick = exportData;
+
+$('importBtn').onclick = () => $('importFile').click();
+$('importFile').onchange = async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  let data;
+  try { data = JSON.parse(await f.text()); } catch { alert('このファイルは読み込めないよ'); return; }
+  if (!data || data.app !== 'dokooita' || !Array.isArray(data.items)) {
+    alert('このアプリのバックアップファイルじゃないみたい');
+    return;
+  }
+  pending = data.items;
+  $('impMsg').textContent = 'バックアップには ' + pending.length + ' 件入ってる。どうする？';
+  $('impDlg').returnValue = '';
+  $('impDlg').showModal();
+};
+
+$('impDlg').onclose = async () => {
+  const mode = $('impDlg').returnValue;
+  const src = pending;
+  pending = null;
+  if (mode !== 'merge' && mode !== 'replace') return;
+  if (mode === 'replace' && !confirm('今のデータ ' + items.length + ' 件は全部消えるよ。いい？')) return;
+
+  // 写真を元の形に戻す（トランザクションの前に全部終わらせる）
+  let conv;
+  try {
+    conv = [];
+    for (const raw of src) {
+      const i = normalize({ ...raw });
+      const ps = [];
+      for (const p of i.places) {
+        ps.push({ memo: p.memo || '', photo: p.photo ? await dataURLToBlob(p.photo) : null });
+      }
+      conv.push({ ...i, places: ps });
+    }
+  } catch { alert('ファイルの中身が壊れてるみたい'); return; }
+
+  let added = 0, updated = 0, skipped = 0;
+  if (mode === 'merge') {
+    const now = new Map(items.map(i => [i.id, i]));
+    conv = conv.filter(i => {
+      const old = now.get(i.id);
+      if (!old) { added++; return true; }
+      if ((i.updated || 0) > (old.updated || 0)) { updated++; return true; }
+      skipped++;
+      return false;
+    });
+  }
+
+  const tx = db.transaction('items', 'readwrite');
+  const st = tx.objectStore('items');
+  if (mode === 'replace') st.clear();
+  conv.forEach(i => st.put(i));
+  tx.oncomplete = () => {
+    load();
+    alert(mode === 'replace'
+      ? conv.length + ' 件に置き換えたよ'
+      : '追加 ' + added + ' 件／更新 ' + updated + ' 件／そのまま ' + skipped + ' 件');
+  };
+  tx.onerror = () => alert('読み込みに失敗した。データは変わってないよ');
+};
+</script>
+</body>
+</html>
